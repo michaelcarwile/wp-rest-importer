@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Fetch all posts from a WordPress site via the REST API and save as a single Markdown file.
+"""Fetch posts, pages, and custom post types from a WordPress site via the REST API and save as Markdown.
 
-Usage: ./wp-rest-retrieve-posts.py <site-url> [--output <file>] [--per-page <n>] [--delay <seconds>]
+Usage: ./wp-rest-retrieve-posts.py <site-url> [--type <types>] [--output <file>] [--per-page <n>] [--delay <seconds>]
 
 Examples:
     ./wp-rest-retrieve-posts.py https://www.example.com
-    ./wp-rest-retrieve-posts.py https://www.example.com --output articles.md --per-page 20
+    ./wp-rest-retrieve-posts.py https://www.example.com --type pages
+    ./wp-rest-retrieve-posts.py https://www.example.com --type posts pages --split
+    ./wp-rest-retrieve-posts.py https://www.example.com --type all --delay 1
 """
 
 import os
@@ -83,7 +85,31 @@ def build_taxonomy_map(base_url, taxonomy, per_page, delay):
     return {item["id"]: html.unescape(item["name"]) for item in items}
 
 
-def post_to_markdown(post, category_map, tag_map):
+_BUILTIN_SKIP = {"attachment", "wp_block", "wp_template", "wp_template_part", "wp_navigation", "nav_menu_item"}
+
+
+def discover_post_types(base_url):
+    """Fetch all public post types and return a list of content types (excluding builtins).
+
+    Each entry is a dict with keys: slug, rest_base, name, taxonomies.
+    """
+    resp = requests.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
+    resp.raise_for_status()
+    types = resp.json()
+    result = []
+    for slug, info in types.items():
+        if slug in _BUILTIN_SKIP:
+            continue
+        result.append({
+            "slug": slug,
+            "rest_base": info.get("rest_base", slug),
+            "name": info.get("name", slug),
+            "taxonomies": info.get("taxonomies", []),
+        })
+    return result
+
+
+def post_to_markdown(post, category_map, tag_map, post_type_slug="post"):
     """Convert a single WP post JSON object to a Markdown string with YAML frontmatter."""
     title = html.unescape(post["title"]["rendered"])
     date = post["date"][:10]
@@ -91,7 +117,7 @@ def post_to_markdown(post, category_map, tag_map):
     content_html = post["content"]["rendered"]
     content_md = converter.handle(content_html).strip()
 
-    frontmatter = {"title": title, "date": date, "url": link}
+    frontmatter = {"title": title, "date": date, "url": link, "type": post_type_slug}
 
     categories = [category_map[cid] for cid in post.get("categories", []) if cid in category_map]
     if categories:
@@ -106,8 +132,10 @@ def post_to_markdown(post, category_map, tag_map):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export WordPress posts to a single Markdown file via the REST API.")
+    parser = argparse.ArgumentParser(description="Export WordPress posts, pages, and custom post types to Markdown via the REST API.")
     parser.add_argument("url", help="WordPress site URL (e.g. https://www.example.com)")
+    parser.add_argument("--type", "-t", nargs="+", default=["posts"], dest="types",
+                        help="Post types to export by REST base name (default: posts). Use 'all' to auto-discover.")
     parser.add_argument("--output", "-o", default=None, help="Output filename (default: <domain>-articles.md)")
     parser.add_argument("--per-page", type=int, default=20, help="Posts per API request (default: 20)")
     parser.add_argument("--delay", type=float, default=3, help="Seconds between requests (default: 3)")
@@ -115,7 +143,6 @@ def main():
     args = parser.parse_args()
 
     base_url = args.url.rstrip("/")
-    endpoint = f"{base_url}/wp-json/wp/v2/posts"
 
     from urllib.parse import urlparse
     domain = urlparse(base_url).hostname.replace("www.", "")
@@ -126,37 +153,112 @@ def main():
     else:
         output_file = args.output or f"{domain}-articles.md"
 
-    print(f"Fetching articles from {base_url}...")
-    posts = fetch_all_items(endpoint, args.per_page, args.delay)
+    # --- Resolve post types ---
+    if "all" in args.types:
+        print(f"Discovering post types on {base_url}...")
+        type_list = discover_post_types(base_url)
+        if not type_list:
+            print("No content types found.", file=sys.stderr)
+            sys.exit(1)
+        print(f"  Found types: {', '.join(t['rest_base'] for t in type_list)}\n")
+    else:
+        # Fetch type metadata to get taxonomy info for requested types
+        print(f"Fetching type metadata from {base_url}...")
+        resp = requests.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
+        resp.raise_for_status()
+        all_types = resp.json()
 
-    if not posts:
-        print("No posts found.", file=sys.stderr)
+        # Build lookup by rest_base
+        rest_base_lookup = {}
+        for slug, info in all_types.items():
+            rb = info.get("rest_base", slug)
+            rest_base_lookup[rb] = {
+                "slug": slug,
+                "rest_base": rb,
+                "name": info.get("name", slug),
+                "taxonomies": info.get("taxonomies", []),
+            }
+
+        type_list = []
+        for requested in args.types:
+            if requested in rest_base_lookup:
+                type_list.append(rest_base_lookup[requested])
+            else:
+                print(f"Warning: unknown post type '{requested}' — skipping.", file=sys.stderr)
+
+        if not type_list:
+            print("No valid post types to export.", file=sys.stderr)
+            sys.exit(1)
+
+    # --- Fetch content for each type ---
+    category_map = None
+    tag_map = None
+    # Collect (slug, rest_base, item, markdown) tuples
+    results = []
+
+    for type_info in type_list:
+        slug = type_info["slug"]
+        rest_base = type_info["rest_base"]
+        taxonomies = type_info["taxonomies"]
+
+        endpoint = f"{base_url}/wp-json/wp/v2/{rest_base}"
+        print(f"Fetching {type_info['name'].lower()} ({rest_base})...")
+        items = fetch_all_items(endpoint, args.per_page, args.delay)
+
+        if not items:
+            print(f"  No {type_info['name'].lower()} found.\n")
+            continue
+        print(f"  Fetched {len(items)} items.\n")
+
+        # Fetch taxonomy maps on demand (at most once each)
+        if "category" in taxonomies and category_map is None:
+            print("Fetching categories...")
+            category_map = build_taxonomy_map(base_url, "categories", per_page=100, delay=args.delay)
+            print(f"  {len(category_map)} categories found.")
+        if "post_tag" in taxonomies and tag_map is None:
+            print("Fetching tags...")
+            tag_map = build_taxonomy_map(base_url, "tags", per_page=100, delay=args.delay)
+            print(f"  {len(tag_map)} tags found.\n")
+
+        cats = category_map if ("category" in taxonomies and category_map) else {}
+        tags = tag_map if ("post_tag" in taxonomies and tag_map) else {}
+
+        for item in items:
+            md = post_to_markdown(item, cats, tags, post_type_slug=slug)
+            results.append((slug, rest_base, item, md))
+
+    if not results:
+        print("No content found across any type.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Fetched {len(posts)} articles.\n")
-
-    print("Fetching categories...")
-    category_map = build_taxonomy_map(base_url, "categories", per_page=100, delay=args.delay)
-    print(f"  {len(category_map)} categories found.")
-
-    print("Fetching tags...")
-    tag_map = build_taxonomy_map(base_url, "tags", per_page=100, delay=args.delay)
-    print(f"  {len(tag_map)} tags found.\n")
-
-    posts.sort(key=lambda p: p["date"])
-    sections = [post_to_markdown(p, category_map, tag_map) for p in posts]
+    # --- Write output ---
+    multi_type = len(type_list) > 1
 
     if args.split:
         os.makedirs(output_dir, exist_ok=True)
-        for i, (post, md) in enumerate(zip(posts, sections), 1):
-            slug = post.get("slug") or re.sub(r"[^\w-]", "", post["title"]["rendered"].lower().replace(" ", "-"))
-            date = post["date"][:10]
-            filename = os.path.join(output_dir, f"{date}-{slug}.md")
+        for _slug, rest_base, item, md in results:
+            item_slug = item.get("slug") or re.sub(r"[^\w-]", "", item["title"]["rendered"].lower().replace(" ", "-"))
+            date = item["date"][:10]
+            if multi_type:
+                subdir = os.path.join(output_dir, rest_base)
+                os.makedirs(subdir, exist_ok=True)
+                filename = os.path.join(subdir, f"{date}-{item_slug}.md")
+            else:
+                filename = os.path.join(output_dir, f"{date}-{item_slug}.md")
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(md)
                 f.write("\n")
-        print(f"Written {len(sections)} files to {output_dir}/")
+        print(f"Written {len(results)} files to {output_dir}/")
     else:
+        # Group by type in request order, sorted by date within each group
+        from collections import OrderedDict
+        groups = OrderedDict()
+        for _slug, rest_base, item, md in results:
+            groups.setdefault(rest_base, []).append((item["date"], md))
+        sections = []
+        for rest_base, entries in groups.items():
+            entries.sort(key=lambda e: e[0])
+            sections.extend(md for _date, md in entries)
         with open(output_file, "w", encoding="utf-8") as f:
             f.write("\n\n".join(sections))
             f.write("\n")
