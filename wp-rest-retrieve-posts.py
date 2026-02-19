@@ -1,16 +1,34 @@
 #!/usr/bin/env python3
 """Fetch all posts from a WordPress site via the REST API and save as a single Markdown file.
 
-Usage: python3 fetch-articles.py <site-url> [--output <file>] [--per-page <n>] [--delay <seconds>]
+Usage: ./wp-rest-retrieve-posts.py <site-url> [--output <file>] [--per-page <n>] [--delay <seconds>]
 
 Examples:
-    python3 fetch-articles.py https://www.example.com
-    python3 fetch-articles.py https://www.example.com --output articles.md --per-page 20
+    ./wp-rest-retrieve-posts.py https://www.example.com
+    ./wp-rest-retrieve-posts.py https://www.example.com --output articles.md --per-page 20
 """
+
+import os
+import subprocess
+import sys
+
+_DEPS = ["html2text", "requests"]
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_VENV = os.path.join(_DIR, ".venv")
+_VENV_PYTHON = os.path.join(_VENV, "bin", "python3")
+
+# Bootstrap: create venv and install deps on first run, then re-exec
+if os.path.realpath(sys.executable) != os.path.realpath(_VENV_PYTHON):
+    if not os.path.exists(_VENV_PYTHON):
+        print("First run — setting up environment...")
+        import venv
+        venv.create(_VENV, with_pip=True)
+        subprocess.check_call([_VENV_PYTHON, "-m", "pip", "install", "-q"] + _DEPS)
+        print("Done.\n")
+    os.execv(_VENV_PYTHON, [_VENV_PYTHON] + sys.argv)
 
 import argparse
 import html
-import sys
 import time
 
 import html2text
