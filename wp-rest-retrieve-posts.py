@@ -59,7 +59,7 @@ def fetch_all_items(endpoint, per_page, delay):
         print(f"  Fetching page {page}...")
         resp = requests.get(endpoint, params={"per_page": per_page, "page": page}, timeout=30)
 
-        if resp.status_code == 400:
+        if resp.status_code in (400, 401, 403, 404):
             break
         resp.raise_for_status()
 
@@ -85,7 +85,11 @@ def build_taxonomy_map(base_url, taxonomy, per_page, delay):
     return {item["id"]: html.unescape(item["name"]) for item in items}
 
 
-_BUILTIN_SKIP = {"attachment", "wp_block", "wp_template", "wp_template_part", "wp_navigation", "nav_menu_item"}
+_BUILTIN_SKIP = {
+    "attachment", "wp_block", "wp_template", "wp_template_part",
+    "wp_navigation", "nav_menu_item", "wp_global_styles",
+    "wp_font_family", "wp_font_face",
+}
 
 
 def discover_post_types(base_url):
@@ -99,6 +103,10 @@ def discover_post_types(base_url):
     result = []
     for slug, info in types.items():
         if slug in _BUILTIN_SKIP:
+            continue
+        rest_base = info.get("rest_base", slug)
+        # Skip types with parameterized rest_base (not directly listable)
+        if "(" in rest_base:
             continue
         result.append({
             "slug": slug,
@@ -114,8 +122,8 @@ def post_to_markdown(post, category_map, tag_map, post_type_slug="post"):
     title = html.unescape(post["title"]["rendered"])
     date = post["date"][:10]
     link = post["link"]
-    content_html = post["content"]["rendered"]
-    content_md = converter.handle(content_html).strip()
+    content_html = post.get("content", {}).get("rendered", "")
+    content_md = converter.handle(content_html).strip() if content_html else ""
 
     frontmatter = {"title": title, "date": date, "url": link, "type": post_type_slug}
 
