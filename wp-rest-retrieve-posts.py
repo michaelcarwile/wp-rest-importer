@@ -9,10 +9,11 @@ Examples:
 """
 
 import os
+import re
 import subprocess
 import sys
 
-_DEPS = ["html2text", "requests"]
+_DEPS = ["html2text", "pyyaml", "requests"]
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _VENV = os.path.join(_DIR, ".venv")
 _VENV_PYTHON = os.path.join(_VENV, "bin", "python3")
@@ -25,6 +26,12 @@ if os.path.realpath(sys.executable) != os.path.realpath(_VENV_PYTHON):
         venv.create(_VENV, with_pip=True)
         subprocess.check_call([_VENV_PYTHON, "-m", "pip", "install", "-q"] + _DEPS)
         print("Done.\n")
+    else:
+        # Ensure all deps are installed (covers newly added packages)
+        subprocess.check_call(
+            [_VENV_PYTHON, "-m", "pip", "install", "-q"] + _DEPS,
+            stdout=subprocess.DEVNULL,
+        )
     os.execv(_VENV_PYTHON, [_VENV_PYTHON] + sys.argv)
 
 import argparse
@@ -33,6 +40,7 @@ import time
 
 import html2text
 import requests
+import yaml
 
 converter = html2text.HTML2Text()
 converter.body_width = 0
@@ -40,8 +48,8 @@ converter.ignore_images = False
 converter.ignore_links = False
 
 
-def fetch_all_posts(endpoint, per_page, delay):
-    """Fetch all posts, paginating through the API."""
+def fetch_all_items(endpoint, per_page, delay):
+    """Fetch all items from a paginated WP REST API endpoint."""
     posts = []
     page = 1
 
@@ -68,15 +76,33 @@ def fetch_all_posts(endpoint, per_page, delay):
     return posts
 
 
-def post_to_markdown(post):
-    """Convert a single WP post JSON object to a Markdown string."""
+def build_taxonomy_map(base_url, taxonomy, per_page, delay):
+    """Fetch all terms for a taxonomy and return an {id: name} dict."""
+    endpoint = f"{base_url}/wp-json/wp/v2/{taxonomy}"
+    items = fetch_all_items(endpoint, per_page, delay)
+    return {item["id"]: html.unescape(item["name"]) for item in items}
+
+
+def post_to_markdown(post, category_map, tag_map):
+    """Convert a single WP post JSON object to a Markdown string with YAML frontmatter."""
     title = html.unescape(post["title"]["rendered"])
     date = post["date"][:10]
     link = post["link"]
     content_html = post["content"]["rendered"]
     content_md = converter.handle(content_html).strip()
 
-    return f"# {title}\n\n**Date:** {date}  \n**URL:** {link}\n\n{content_md}"
+    frontmatter = {"title": title, "date": date, "url": link}
+
+    categories = [category_map[cid] for cid in post.get("categories", []) if cid in category_map]
+    if categories:
+        frontmatter["categories"] = categories
+
+    tags = [tag_map[tid] for tid in post.get("tags", []) if tid in tag_map]
+    if tags:
+        frontmatter["tags"] = tags
+
+    fm_str = yaml.dump(frontmatter, sort_keys=False, allow_unicode=True, default_flow_style=False).rstrip()
+    return f"---\n{fm_str}\n---\n\n{content_md}"
 
 
 def main():
@@ -85,21 +111,23 @@ def main():
     parser.add_argument("--output", "-o", default=None, help="Output filename (default: <domain>-articles.md)")
     parser.add_argument("--per-page", type=int, default=20, help="Posts per API request (default: 20)")
     parser.add_argument("--delay", type=float, default=3, help="Seconds between requests (default: 3)")
+    parser.add_argument("--split", action="store_true", help="Write one Markdown file per post into an output directory")
     args = parser.parse_args()
 
     base_url = args.url.rstrip("/")
     endpoint = f"{base_url}/wp-json/wp/v2/posts"
 
-    # Derive default output filename from domain
-    if args.output:
-        output_file = args.output
+    from urllib.parse import urlparse
+    domain = urlparse(base_url).hostname.replace("www.", "")
+
+    # Derive default output path from domain
+    if args.split:
+        output_dir = args.output or f"{domain}-articles"
     else:
-        from urllib.parse import urlparse
-        domain = urlparse(base_url).hostname.replace("www.", "")
-        output_file = f"{domain}-articles.md"
+        output_file = args.output or f"{domain}-articles.md"
 
     print(f"Fetching articles from {base_url}...")
-    posts = fetch_all_posts(endpoint, args.per_page, args.delay)
+    posts = fetch_all_items(endpoint, args.per_page, args.delay)
 
     if not posts:
         print("No posts found.", file=sys.stderr)
@@ -107,14 +135,32 @@ def main():
 
     print(f"Fetched {len(posts)} articles.\n")
 
+    print("Fetching categories...")
+    category_map = build_taxonomy_map(base_url, "categories", per_page=100, delay=args.delay)
+    print(f"  {len(category_map)} categories found.")
+
+    print("Fetching tags...")
+    tag_map = build_taxonomy_map(base_url, "tags", per_page=100, delay=args.delay)
+    print(f"  {len(tag_map)} tags found.\n")
+
     posts.sort(key=lambda p: p["date"])
-    sections = [post_to_markdown(p) for p in posts]
+    sections = [post_to_markdown(p, category_map, tag_map) for p in posts]
 
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write("\n\n---\n\n".join(sections))
-        f.write("\n")
-
-    print(f"Written to {output_file}")
+    if args.split:
+        os.makedirs(output_dir, exist_ok=True)
+        for i, (post, md) in enumerate(zip(posts, sections), 1):
+            slug = post.get("slug") or re.sub(r"[^\w-]", "", post["title"]["rendered"].lower().replace(" ", "-"))
+            date = post["date"][:10]
+            filename = os.path.join(output_dir, f"{date}-{slug}.md")
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(md)
+                f.write("\n")
+        print(f"Written {len(sections)} files to {output_dir}/")
+    else:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(sections))
+            f.write("\n")
+        print(f"Written to {output_file}")
 
 
 if __name__ == "__main__":
