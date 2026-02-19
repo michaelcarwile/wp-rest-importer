@@ -83,8 +83,8 @@ def main():
     parser = argparse.ArgumentParser(description="Export WordPress posts to a single Markdown file via the REST API.")
     parser.add_argument("url", help="WordPress site URL (e.g. https://www.example.com)")
     parser.add_argument("--output", "-o", default=None, help="Output filename (default: <domain>-articles.md)")
-    parser.add_argument("--per-page", type=int, default=10, help="Posts per API request (default: 10)")
-    parser.add_argument("--delay", type=float, default=1, help="Seconds between requests (default: 1)")
+    parser.add_argument("--per-page", type=int, default=20, help="Posts per API request (default: 20)")
+    parser.add_argument("--delay", type=float, default=3, help="Seconds between requests (default: 3)")
     args = parser.parse_args()
 
     base_url = args.url.rstrip("/")

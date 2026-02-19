@@ -16,8 +16,8 @@ That's it. On first run, the script automatically creates a virtual environment 
 # Custom output file
 ./wp-rest-retrieve-posts.py https://www.example.com -o my-posts.md
 
-# Adjust pagination and rate limiting
-./wp-rest-retrieve-posts.py https://www.example.com --per-page 20 --delay 2
+# Adjust pagination and rate limiting (defaults: 20 posts/request, 3s delay)
+./wp-rest-retrieve-posts.py https://www.example.com --per-page 50 --delay 1
 ```
 
 Output is a single Markdown file with all posts sorted by date (oldest first), separated by horizontal rules.
@@ -31,8 +31,8 @@ Output is a single Markdown file with all posts sorted by date (oldest first), s
 
 ## Roadmap
 
-- [ ] Publish/import downloaded articles into another WordPress site
-- [ ] Support for pages and custom post types (not just posts)
 - [ ] Category and tag preservation in export
+- [ ] Support for pages and custom post types (not just posts)
 - [ ] Featured image downloading
 - [ ] Authenticated API access for private/draft posts
+- [ ] Publish/import downloaded articles into another WordPress site
