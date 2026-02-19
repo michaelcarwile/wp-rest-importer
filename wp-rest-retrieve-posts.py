@@ -49,6 +49,9 @@ converter.body_width = 0
 converter.ignore_images = False
 converter.ignore_links = False
 
+session = requests.Session()
+session.headers["User-Agent"] = "WP-REST-Importer/1.0"
+
 
 def fetch_all_items(endpoint, per_page, delay):
     """Fetch all items from a paginated WP REST API endpoint."""
@@ -57,9 +60,9 @@ def fetch_all_items(endpoint, per_page, delay):
 
     while True:
         print(f"  Fetching page {page}...")
-        resp = requests.get(endpoint, params={"per_page": per_page, "page": page}, timeout=30)
+        resp = session.get(endpoint, params={"per_page": per_page, "page": page}, timeout=30)
 
-        if resp.status_code in (400, 401, 403, 404):
+        if resp.status_code == 400:
             break
         resp.raise_for_status()
 
@@ -97,7 +100,7 @@ def discover_post_types(base_url):
 
     Each entry is a dict with keys: slug, rest_base, name, taxonomies.
     """
-    resp = requests.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
+    resp = session.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
     resp.raise_for_status()
     types = resp.json()
     result = []
@@ -170,22 +173,32 @@ def main():
             sys.exit(1)
         print(f"  Found types: {', '.join(t['rest_base'] for t in type_list)}\n")
     else:
+        # Well-known defaults for when /types endpoint is unavailable
+        _WELL_KNOWN = {
+            "posts": {"slug": "post", "rest_base": "posts", "name": "Posts", "taxonomies": ["category", "post_tag"]},
+            "pages": {"slug": "page", "rest_base": "pages", "name": "Pages", "taxonomies": []},
+        }
+
         # Fetch type metadata to get taxonomy info for requested types
         print(f"Fetching type metadata from {base_url}...")
-        resp = requests.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
-        resp.raise_for_status()
-        all_types = resp.json()
+        resp = session.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
 
-        # Build lookup by rest_base
         rest_base_lookup = {}
-        for slug, info in all_types.items():
-            rb = info.get("rest_base", slug)
-            rest_base_lookup[rb] = {
-                "slug": slug,
-                "rest_base": rb,
-                "name": info.get("name", slug),
-                "taxonomies": info.get("taxonomies", []),
-            }
+        if resp.status_code in (401, 403):
+            print("  Types endpoint restricted — using well-known defaults.")
+            rest_base_lookup = dict(_WELL_KNOWN)
+        else:
+            resp.raise_for_status()
+            all_types = resp.json()
+            # Build lookup by rest_base
+            for slug, info in all_types.items():
+                rb = info.get("rest_base", slug)
+                rest_base_lookup[rb] = {
+                    "slug": slug,
+                    "rest_base": rb,
+                    "name": info.get("name", slug),
+                    "taxonomies": info.get("taxonomies", []),
+                }
 
         type_list = []
         for requested in args.types:
@@ -211,7 +224,11 @@ def main():
 
         endpoint = f"{base_url}/wp-json/wp/v2/{rest_base}"
         print(f"Fetching {type_info['name'].lower()} ({rest_base})...")
-        items = fetch_all_items(endpoint, args.per_page, args.delay)
+        try:
+            items = fetch_all_items(endpoint, args.per_page, args.delay)
+        except requests.exceptions.HTTPError as e:
+            print(f"  Skipping — {e}\n")
+            continue
 
         if not items:
             print(f"  No {type_info['name'].lower()} found.\n")
