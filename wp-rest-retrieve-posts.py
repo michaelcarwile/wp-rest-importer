@@ -88,6 +88,62 @@ def build_taxonomy_map(base_url, taxonomy, per_page, delay):
     return {item["id"]: html.unescape(item["name"]) for item in items}
 
 
+def build_media_map(base_url, media_ids, per_page, delay):
+    """Batch-fetch media metadata and return {media_id: source_url}."""
+    media_map = {}
+    ids = list(media_ids)
+    for i in range(0, len(ids), per_page):
+        chunk = ids[i:i + per_page]
+        include = ",".join(str(mid) for mid in chunk)
+        url = f"{base_url}/wp-json/wp/v2/media"
+        try:
+            resp = session.get(url, params={"include": include, "per_page": per_page}, timeout=30)
+            resp.raise_for_status()
+            for item in resp.json():
+                source = item.get("source_url")
+                if source:
+                    media_map[item["id"]] = source
+        except requests.exceptions.RequestException as e:
+            print(f"  Warning: failed to fetch media chunk — {e}", file=sys.stderr)
+        if i + per_page < len(ids):
+            time.sleep(delay)
+    return media_map
+
+
+def download_images(media_map, images_dir, delay):
+    """Download images to disk. Returns {media_id: local_filename}. Skips existing files."""
+    from urllib.parse import urlparse as _urlparse, unquote as _unquote
+    os.makedirs(images_dir, exist_ok=True)
+    result = {}
+    # Track filenames to detect true collisions
+    used_filenames = set()
+    for mid, source_url in media_map.items():
+        filename = _unquote(_urlparse(source_url).path.rsplit("/", 1)[-1])
+        if filename in used_filenames:
+            name, ext = os.path.splitext(filename)
+            filename = f"{mid}-{name}{ext}"
+        used_filenames.add(filename)
+
+        filepath = os.path.join(images_dir, filename)
+        if os.path.exists(filepath):
+            print(f"  Skipping (exists): {filename}")
+            result[mid] = filename
+            continue
+
+        try:
+            resp = session.get(source_url, stream=True, timeout=60)
+            resp.raise_for_status()
+            with open(filepath, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f"  Downloaded: {filename}")
+            result[mid] = filename
+        except requests.exceptions.RequestException as e:
+            print(f"  Warning: failed to download {source_url} — {e}", file=sys.stderr)
+        time.sleep(delay)
+    return result
+
+
 def probe_api(base_url):
     """Probe the WP REST API root and return the response JSON, or exit with a clear error."""
     url = f"{base_url}/wp-json/"
@@ -156,7 +212,7 @@ def discover_post_types(base_url, root_data):
     return result
 
 
-def post_to_markdown(post, category_map, tag_map, post_type_slug="post"):
+def post_to_markdown(post, category_map, tag_map, post_type_slug="post", image_context=None):
     """Convert a single WP post JSON object to a Markdown string with YAML frontmatter."""
     title = html.unescape(post["title"]["rendered"])
     date = post["date"][:10]
@@ -165,6 +221,11 @@ def post_to_markdown(post, category_map, tag_map, post_type_slug="post"):
     content_md = converter.handle(content_html).strip() if content_html else ""
 
     frontmatter = {"title": title, "date": date, "url": link, "type": post_type_slug}
+
+    featured_media = post.get("featured_media", 0)
+    if featured_media and image_context and featured_media in image_context:
+        ctx = image_context[featured_media]
+        frontmatter["featured_image"] = ctx.get("local_path") or ctx.get("source_url")
 
     categories = [category_map[cid] for cid in post.get("categories", []) if cid in category_map]
     if categories:
@@ -187,6 +248,7 @@ def main():
     parser.add_argument("--per-page", type=int, default=20, help="Posts per API request (default: 20)")
     parser.add_argument("--delay", type=float, default=3, help="Seconds between requests (default: 3)")
     parser.add_argument("--split", action="store_true", help="Write one Markdown file per post into an output directory")
+    parser.add_argument("--images", action="store_true", help="Download featured images locally")
     args = parser.parse_args()
 
     base_url = args.url.rstrip("/")
@@ -246,8 +308,8 @@ def main():
     # --- Fetch content for each type ---
     category_map = None
     tag_map = None
-    # Collect (slug, rest_base, item, markdown) tuples
-    results = []
+    # Collect (slug, rest_base, item, cats, tags) tuples — markdown rendered later
+    collected = []
 
     for type_info in type_list:
         slug = type_info["slug"]
@@ -281,16 +343,56 @@ def main():
         tags = tag_map if ("post_tag" in taxonomies and tag_map) else {}
 
         for item in items:
-            md = post_to_markdown(item, cats, tags, post_type_slug=slug)
-            results.append((slug, rest_base, item, md))
+            collected.append((slug, rest_base, item, cats, tags))
 
-    if not results:
+    if not collected:
         print("No content found across any type.", file=sys.stderr)
         sys.exit(1)
 
-    # --- Write output ---
+    # --- Featured images ---
     multi_type = len(type_list) > 1
+    image_context = {}
 
+    media_ids = {item.get("featured_media", 0) for _, _, item, _, _ in collected}
+    media_ids.discard(0)
+
+    if media_ids:
+        print(f"Fetching metadata for {len(media_ids)} featured images...")
+        media_map = build_media_map(base_url, media_ids, per_page=100, delay=args.delay)
+        print(f"  {len(media_map)} source URLs resolved.\n")
+
+        # Determine images directory and frontmatter prefix
+        if args.images:
+            if args.split:
+                images_dir = os.path.join(output_dir, "images")
+                if multi_type:
+                    fm_prefix = "../images"
+                else:
+                    fm_prefix = "images"
+            else:
+                images_dir = f"{domain}-images"
+                fm_prefix = f"{domain}-images"
+
+            print(f"Downloading images to {images_dir}/...")
+            local_map = download_images(media_map, images_dir, args.delay)
+            print(f"  {len(local_map)} images ready.\n")
+
+            for mid, source_url in media_map.items():
+                ctx = {"source_url": source_url}
+                if mid in local_map:
+                    ctx["local_path"] = f"{fm_prefix}/{local_map[mid]}"
+                image_context[mid] = ctx
+        else:
+            for mid, source_url in media_map.items():
+                image_context[mid] = {"source_url": source_url}
+
+    # --- Render markdown ---
+    results = []
+    for slug, rest_base, item, cats, tags in collected:
+        md = post_to_markdown(item, cats, tags, post_type_slug=slug, image_context=image_context)
+        results.append((slug, rest_base, item, md))
+
+    # --- Write output ---
     if args.split:
         os.makedirs(output_dir, exist_ok=True)
         for _slug, rest_base, item, md in results:

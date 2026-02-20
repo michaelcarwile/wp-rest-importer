@@ -28,6 +28,12 @@ That's it. On first run, the script automatically creates a virtual environment 
 # Auto-discover and export all public post types
 ./wp-rest-retrieve-posts.py https://www.example.com --type all
 
+# Download featured images locally
+./wp-rest-retrieve-posts.py https://www.example.com --images
+
+# Split mode with images (images stored in <output-dir>/images/)
+./wp-rest-retrieve-posts.py https://www.example.com --split --images
+
 # Adjust pagination and rate limiting (defaults: 20 posts/request, 3s delay)
 ./wp-rest-retrieve-posts.py https://www.example.com --per-page 50 --delay 1
 ```
@@ -40,6 +46,7 @@ title: "Post Title"
 date: 2024-01-15
 url: https://example.com/post
 type: post
+featured_image: images/photo.jpg
 categories:
   - News
 tags:
@@ -49,7 +56,7 @@ tags:
 Post content here...
 ```
 
-Categories and tags are resolved to their names automatically. Keys are omitted when a post has no categories or tags. The `type` field reflects the WordPress post type slug (e.g., `post`, `page`).
+Categories and tags are resolved to their names automatically. Keys are omitted when a post has no categories or tags. The `type` field reflects the WordPress post type slug (e.g., `post`, `page`). When a post has a featured image, `featured_image` contains either the source URL (default) or a local path (with `--images`).
 
 ## Files
 
@@ -62,6 +69,6 @@ Categories and tags are resolved to their names automatically. Keys are omitted 
 
 - [x] Category and tag preservation in export
 - [x] Support for pages and custom post types (not just posts)
-- [ ] Featured image downloading
+- [x] Featured image downloading
 - [ ] Authenticated API access for private/draft posts
 - [ ] Publish/import downloaded articles into another WordPress site
