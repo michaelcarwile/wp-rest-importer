@@ -253,6 +253,9 @@ def main():
 
     base_url = args.url.rstrip("/")
 
+    print("Note: This tool is for exporting content you own or have permission to use.")
+    print("      Respect copyright and the site's terms of service.\n")
+
     # Probe the REST API before doing anything else
     root_data = probe_api(base_url)
 
