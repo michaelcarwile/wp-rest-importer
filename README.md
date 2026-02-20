@@ -1,5 +1,7 @@
 # WP REST Importer
 
+> **Respect copyright.** This tool is intended for exporting content you own, have authored, or have explicit permission to use. WordPress content — including text, images, and media — is protected by copyright. Do not use this tool to reproduce, redistribute, or repurpose another site's content without authorization. You are solely responsible for ensuring your use complies with applicable copyright laws and the site's terms of service.
+
 A toolkit for working with WordPress content via the REST API. Supports pulling posts, pages, and custom post types from any public WordPress site and exporting them as clean Markdown. The script probes the REST API on startup and fails fast with a clear message if the site doesn't expose one.
 
 ## Quick Start
