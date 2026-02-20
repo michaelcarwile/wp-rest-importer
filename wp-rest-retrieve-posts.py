@@ -88,32 +88,68 @@ def build_taxonomy_map(base_url, taxonomy, per_page, delay):
     return {item["id"]: html.unescape(item["name"]) for item in items}
 
 
-_BUILTIN_SKIP = {
-    "attachment", "wp_block", "wp_template", "wp_template_part",
-    "wp_navigation", "nav_menu_item", "wp_global_styles",
-    "wp_font_family", "wp_font_face",
-}
+def probe_api(base_url):
+    """Probe the WP REST API root and return the response JSON, or exit with a clear error."""
+    url = f"{base_url}/wp-json/"
+    try:
+        resp = session.get(url, timeout=30)
+    except requests.exceptions.RequestException as e:
+        print(f"Error: Could not connect to {base_url} — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    content_type = resp.headers.get("content-type", "")
+    if resp.status_code != 200 or "application/json" not in content_type:
+        print(f"Error: {base_url} does not appear to have a WordPress REST API.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        data = resp.json()
+    except ValueError:
+        print(f"Error: {base_url} does not appear to have a WordPress REST API.", file=sys.stderr)
+        sys.exit(1)
+
+    if "namespaces" not in data or "routes" not in data:
+        print(f"Error: {base_url} does not appear to have a WordPress REST API.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Site: {data.get('name', base_url)}")
+    return data
 
 
-def discover_post_types(base_url):
-    """Fetch all public post types and return a list of content types (excluding builtins).
+def _listable_rest_bases(routes):
+    """Extract rest_bases that have a simple listable GET route under /wp/v2/."""
+    bases = set()
+    for route_pattern, route_info in routes.items():
+        # Match routes like /wp/v2/posts but not /wp/v2/posts/(?P<id>[\d]+)
+        m = re.match(r"^/wp/v2/([a-zA-Z0-9_-]+)$", route_pattern)
+        if not m:
+            continue
+        for endpoint in route_info.get("endpoints", []):
+            if "GET" in endpoint.get("methods", []):
+                bases.add(m.group(1))
+                break
+    return bases
 
-    Each entry is a dict with keys: slug, rest_base, name, taxonomies.
+
+def discover_post_types(base_url, root_data):
+    """Discover content types using routes from the root response and /types metadata.
+
+    Only returns types whose rest_base has a simple listable route in /wp/v2/.
     """
+    listable = _listable_rest_bases(root_data.get("routes", {}))
+
     resp = session.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
     resp.raise_for_status()
     types = resp.json()
+
     result = []
     for slug, info in types.items():
-        if slug in _BUILTIN_SKIP:
-            continue
         rest_base = info.get("rest_base", slug)
-        # Skip types with parameterized rest_base (not directly listable)
-        if "(" in rest_base:
+        if rest_base not in listable:
             continue
         result.append({
             "slug": slug,
-            "rest_base": info.get("rest_base", slug),
+            "rest_base": rest_base,
             "name": info.get("name", slug),
             "taxonomies": info.get("taxonomies", []),
         })
@@ -155,6 +191,9 @@ def main():
 
     base_url = args.url.rstrip("/")
 
+    # Probe the REST API before doing anything else
+    root_data = probe_api(base_url)
+
     from urllib.parse import urlparse
     domain = urlparse(base_url).hostname.replace("www.", "")
 
@@ -167,7 +206,7 @@ def main():
     # --- Resolve post types ---
     if "all" in args.types:
         print(f"Discovering post types on {base_url}...")
-        type_list = discover_post_types(base_url)
+        type_list = discover_post_types(base_url, root_data)
         if not type_list:
             print("No content types found.", file=sys.stderr)
             sys.exit(1)

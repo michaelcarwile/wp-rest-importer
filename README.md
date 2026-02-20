@@ -1,6 +1,6 @@
 # WP REST Importer
 
-A toolkit for working with WordPress content via the REST API. Supports pulling posts, pages, and custom post types from any public WordPress site and exporting them as clean Markdown.
+A toolkit for working with WordPress content via the REST API. Supports pulling posts, pages, and custom post types from any public WordPress site and exporting them as clean Markdown. The script probes the REST API on startup and fails fast with a clear message if the site doesn't expose one.
 
 ## Quick Start
 
