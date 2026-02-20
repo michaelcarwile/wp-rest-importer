@@ -1,3 +1,4 @@
-*-articles.md
 .venv/
 __pycache__/
+*-articles/
+*-articles.md
