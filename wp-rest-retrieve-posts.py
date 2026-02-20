@@ -173,37 +173,30 @@ def main():
             sys.exit(1)
         print(f"  Found types: {', '.join(t['rest_base'] for t in type_list)}\n")
     else:
-        # Well-known defaults for when /types endpoint is unavailable
         _WELL_KNOWN = {
             "posts": {"slug": "post", "rest_base": "posts", "name": "Posts", "taxonomies": ["category", "post_tag"]},
             "pages": {"slug": "page", "rest_base": "pages", "name": "Pages", "taxonomies": []},
         }
 
-        # Fetch type metadata to get taxonomy info for requested types
-        print(f"Fetching type metadata from {base_url}...")
-        resp = session.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
-
-        rest_base_lookup = {}
-        if resp.status_code in (401, 403):
-            print("  Types endpoint restricted — using well-known defaults.")
-            rest_base_lookup = dict(_WELL_KNOWN)
-        else:
+        # Only fetch /types if the user requested a non-well-known type
+        unknown = [t for t in args.types if t not in _WELL_KNOWN]
+        if unknown:
+            print(f"Fetching type metadata from {base_url}...")
+            resp = session.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
             resp.raise_for_status()
             all_types = resp.json()
-            # Build lookup by rest_base
             for slug, info in all_types.items():
                 rb = info.get("rest_base", slug)
-                rest_base_lookup[rb] = {
-                    "slug": slug,
-                    "rest_base": rb,
+                _WELL_KNOWN[rb] = {
+                    "slug": slug, "rest_base": rb,
                     "name": info.get("name", slug),
                     "taxonomies": info.get("taxonomies", []),
                 }
 
         type_list = []
         for requested in args.types:
-            if requested in rest_base_lookup:
-                type_list.append(rest_base_lookup[requested])
+            if requested in _WELL_KNOWN:
+                type_list.append(_WELL_KNOWN[requested])
             else:
                 print(f"Warning: unknown post type '{requested}' — skipping.", file=sys.stderr)
 
