@@ -41,9 +41,11 @@ if os.path.realpath(sys.executable) != os.path.realpath(_VENV_PYTHON):
 
 import argparse
 import html
+import json
 import random
 import time
 
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import html2text
@@ -68,35 +70,116 @@ converter.ignore_links = False
 
 
 # ---------------------------------------------------------------------------
-# Progress tracking (checkpoint/resume) — pattern from importer-sitemap-parser
+# Manifest tracking (checkpoint/resume)
 # ---------------------------------------------------------------------------
 
-def load_progress(path):
-    """Read a progress file. Returns (done_urls set, last_completed_page int)."""
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_manifest(output_dir):
+    """Read manifest.json from output_dir. Returns dict (or empty default)."""
+    path = os.path.join(output_dir, "manifest.json")
     if not os.path.exists(path):
-        return set(), 0
-    done = set()
-    last_page = 0
+        return {}
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("PAGE:"):
-                last_page = int(line.split(":")[1])
-            elif line:
-                done.add(line)
-    return done, last_page
+        return json.load(f)
 
 
-def save_progress(path, url):
-    """Append a single completed URL to the progress file."""
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(url + "\n")
+def save_manifest(output_dir, manifest):
+    """Write manifest.json atomically (write to tmp, then rename)."""
+    manifest["updated_at"] = _now_iso()
+    path = os.path.join(output_dir, "manifest.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
 
 
-def save_page_progress(path, page):
-    """Mark a page as fully completed in the progress file."""
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"PAGE:{page}\n")
+def get_type_state(manifest, rest_base):
+    """Return the type status dict for rest_base, or None."""
+    return manifest.get("types", {}).get(rest_base)
+
+
+def update_type_state(manifest, rest_base, **kwargs):
+    """Update fields on a type entry, creating it if needed."""
+    manifest.setdefault("types", {})
+    manifest["types"].setdefault(rest_base, {})
+    manifest["types"][rest_base].update(kwargs)
+
+
+def _migrate_progress_files(output_dir, type_list):
+    """Migrate legacy .progress-* files into a manifest.json. Returns manifest dict."""
+    manifest = {
+        "started_at": _now_iso(),
+        "updated_at": _now_iso(),
+        "status": "in_progress",
+        "types": {},
+    }
+    migrated_any = False
+
+    for type_info in type_list:
+        rest_base = type_info["rest_base"]
+        progress_file = os.path.join(output_dir, f".progress-{rest_base}")
+        if not os.path.exists(progress_file):
+            continue
+
+        # Parse legacy progress file
+        last_page = 0
+        url_count = 0
+        with open(progress_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("PAGE:"):
+                    last_page = int(line.split(":")[1])
+                elif line:
+                    url_count += 1
+
+        manifest["types"][rest_base] = {
+            "status": "in_progress",
+            "total_items": None,
+            "total_pages": None,
+            "last_page": last_page,
+            "items_written": url_count,
+            "started_at": _now_iso(),
+            "completed_at": None,
+        }
+        migrated_any = True
+        # Remove legacy file
+        os.remove(progress_file)
+        print(f"  Migrated .progress-{rest_base} → manifest.json (page {last_page}, {url_count} items)", flush=True)
+
+    if migrated_any:
+        save_manifest(output_dir, manifest)
+    return manifest if migrated_any else {}
+
+
+def init_manifest(output_dir, domain, base_url, type_list):
+    """Load or create the manifest. Handles migration from legacy progress files."""
+    manifest = load_manifest(output_dir)
+    if manifest:
+        return manifest
+
+    # Try migrating legacy progress files
+    manifest = _migrate_progress_files(output_dir, type_list)
+    if manifest:
+        manifest["domain"] = domain
+        manifest["base_url"] = base_url
+        save_manifest(output_dir, manifest)
+        return manifest
+
+    # Fresh start
+    manifest = {
+        "domain": domain,
+        "base_url": base_url,
+        "started_at": _now_iso(),
+        "updated_at": _now_iso(),
+        "status": "in_progress",
+        "types": {},
+    }
+    save_manifest(output_dir, manifest)
+    return manifest
 
 
 def throttle(delay):
@@ -412,6 +495,18 @@ def main():
         print(f"  {len(tag_map)} tags found.\n", flush=True)
         throttle(args.delay)
 
+    # --- Initialize manifest ---
+    manifest = init_manifest(output_dir, domain, base_url, type_list)
+
+    # Record taxonomy counts
+    if category_map or tag_map:
+        manifest.setdefault("taxonomies", {})
+        if category_map:
+            manifest["taxonomies"]["categories"] = len(category_map)
+        if tag_map:
+            manifest["taxonomies"]["tags"] = len(tag_map)
+        save_manifest(output_dir, manifest)
+
     # --- Pull each type incrementally ---
     multi_type = len(type_list) > 1
     total_written = 0
@@ -423,18 +518,38 @@ def main():
         cats = category_map if "category" in taxonomies else {}
         tags = tag_map if "post_tag" in taxonomies else {}
 
-        # Set up output directory and progress file
+        # Check manifest for existing state
+        ts = get_type_state(manifest, rest_base)
+        if ts and ts.get("status") == "complete":
+            print(f"\nSkipping {rest_base} — already complete ({ts.get('items_written', '?')} items).", flush=True)
+            continue
+
+        # Set up output directory
         if multi_type:
             type_dir = os.path.join(output_dir, rest_base)
         else:
             type_dir = output_dir
         os.makedirs(type_dir, exist_ok=True)
-        progress_file = os.path.join(output_dir, f".progress-{rest_base}")
-        done_urls, last_page = load_progress(progress_file)
-        start_page = last_page + 1 if last_page else 1
 
-        if done_urls:
-            print(f"Resuming {rest_base} — {len(done_urls)} already done, starting at page {start_page}.", flush=True)
+        # Resume from last_page if in progress
+        last_page = ts.get("last_page", 0) if ts else 0
+        start_page = last_page + 1 if last_page else 1
+        items_written = ts.get("items_written", 0) if ts else 0
+
+        if last_page:
+            print(f"Resuming {rest_base} — {items_written} items written, starting at page {start_page}.", flush=True)
+
+        # Initialize type state
+        if not ts:
+            update_type_state(manifest, rest_base,
+                              status="in_progress",
+                              total_items=None,
+                              total_pages=None,
+                              last_page=0,
+                              items_written=0,
+                              started_at=_now_iso(),
+                              completed_at=None)
+            save_manifest(output_dir, manifest)
 
         endpoint = f"{base_url}/wp-json/wp/v2/{rest_base}"
         print(f"\nPulling {type_info['name'].lower()} ({rest_base})...", flush=True)
@@ -445,31 +560,48 @@ def main():
         for page_num, batch, total, total_pages in fetch_pages(endpoint, args.per_page, args.delay, start_page=start_page):
             if first_page:
                 print(f"  Total: {total} items across {total_pages} pages", flush=True)
+                update_type_state(manifest, rest_base, total_items=total, total_pages=total_pages)
                 first_page = False
 
             for item in batch:
-                link = item.get("link", "")
-                if link in done_urls:
-                    continue
-
                 title_obj = item.get("title", {})
                 title_raw = title_obj.get("rendered", "") if isinstance(title_obj, dict) else str(title_obj)
                 item_slug = item.get("slug") or re.sub(r"[^\w-]", "", title_raw.lower().replace(" ", "-"))
                 date = item["date"][:10]
                 filename = os.path.join(type_dir, f"{date}-{item_slug}.md")
 
+                # Skip if file already exists (handles partial-page edge case on resume)
+                if os.path.exists(filename):
+                    continue
+
                 md = post_to_markdown(item, cats, tags, post_type_slug=slug)
                 with open(filename, "w", encoding="utf-8") as f:
                     f.write(md)
                     f.write("\n")
-
-                save_progress(progress_file, link)
                 type_written += 1
 
-            save_page_progress(progress_file, page_num)
+            # Update manifest after each page
+            items_written += type_written
+            update_type_state(manifest, rest_base, last_page=page_num, items_written=items_written)
+            save_manifest(output_dir, manifest)
+            type_written = 0  # reset page counter (items_written is cumulative)
 
-        print(f"  Written {type_written} new files to {type_dir}/", flush=True)
-        total_written += type_written
+        # Mark type complete
+        update_type_state(manifest, rest_base, status="complete", completed_at=_now_iso(), items_written=items_written)
+        save_manifest(output_dir, manifest)
+
+        page_written = items_written - (ts.get("items_written", 0) if ts else 0)
+        print(f"  Written {page_written} new files to {type_dir}/", flush=True)
+        total_written += page_written
+
+    # Update overall status
+    all_complete = all(
+        manifest.get("types", {}).get(t["rest_base"], {}).get("status") == "complete"
+        for t in type_list
+    )
+    if all_complete:
+        manifest["status"] = "complete"
+        save_manifest(output_dir, manifest)
 
     # --- Resolve featured media URLs ---
     # Scan written files for featured_media_id, batch-fetch source URLs
@@ -518,12 +650,6 @@ def main():
                 fh.write(content)
             updated += 1
         print(f"  Updated {updated} files with image references.", flush=True)
-
-    # Clean up progress files on full completion
-    for type_info in type_list:
-        pf = os.path.join(output_dir, f".progress-{type_info['rest_base']}")
-        if os.path.exists(pf):
-            os.remove(pf)
 
     print(f"\nDone. {total_written} total files written to {output_dir}/", flush=True)
 
