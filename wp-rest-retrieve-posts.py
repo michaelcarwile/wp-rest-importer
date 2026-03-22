@@ -212,7 +212,7 @@ def fetch_pages(endpoint, per_page, delay, start_page=1):
         print(f"  Fetching page {page}...", flush=True)
         resp = _request_with_retry(endpoint, params={"per_page": per_page, "page": page})
 
-        if resp.status_code == 400:
+        if resp.status_code in (400, 401, 403):
             break
         resp.raise_for_status()
 
@@ -406,12 +406,13 @@ def post_to_markdown(post, category_map, tag_map, post_type_slug="post", image_c
 def main():
     parser = argparse.ArgumentParser(description="Export WordPress posts, pages, and custom post types to Markdown via the REST API.")
     parser.add_argument("url", help="WordPress site URL (e.g. https://www.example.com)")
-    parser.add_argument("--type", "-t", nargs="+", default=["posts"], dest="types",
-                        help="Post types to export by REST base name (default: posts). Use 'all' to auto-discover.")
+    parser.add_argument("--type", "-t", nargs="+", default=["all"], dest="types",
+                        help="Post types to export by REST base name (default: all). Use 'all' to auto-discover.")
     parser.add_argument("--output", "-o", default=None, help="Output directory (default: <domain>-articles)")
     parser.add_argument("--per-page", type=int, default=100, help="Posts per API request (default: 100)")
     parser.add_argument("--delay", type=float, default=18, help="Seconds between requests (default: 18)")
     parser.add_argument("--images", action="store_true", help="Download featured images locally")
+    parser.add_argument("--yes", "-y", action="store_true", help="Skip interactive prompt — pull all types without asking")
     parser.add_argument("--cookie", default=None, help="Cookie string to bypass bot protection (e.g. 'name=value; name2=value2')")
     args = parser.parse_args()
 
@@ -436,47 +437,103 @@ def main():
     output_dir = args.output or f"{domain}-articles"
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- Resolve post types ---
-    if "all" in args.types:
-        print(f"Discovering post types on {base_url}...", flush=True)
-        type_list = discover_post_types(base_url, root_data)
-        if not type_list:
-            print("No content types found.", file=sys.stderr)
-            sys.exit(1)
-        print(f"  Found types: {', '.join(t['rest_base'] for t in type_list)}\n", flush=True)
-    else:
-        _WELL_KNOWN = {
-            "posts": {"slug": "post", "rest_base": "posts", "name": "Posts", "taxonomies": ["category", "post_tag"]},
-            "pages": {"slug": "page", "rest_base": "pages", "name": "Pages", "taxonomies": []},
-        }
+    # --- Resolve types and build inventory ---
+    explicit_types = "all" not in args.types
 
-        # Only fetch /types if the user requested a non-well-known type
-        unknown = [t for t in args.types if t not in _WELL_KNOWN]
-        if unknown:
-            print(f"Fetching type metadata from {base_url}...", flush=True)
-            resp = session.get(f"{base_url}/wp-json/wp/v2/types", timeout=30)
-            resp.raise_for_status()
-            all_types = resp.json()
-            for slug, info in all_types.items():
-                rb = info.get("rest_base", slug)
-                _WELL_KNOWN[rb] = {
-                    "slug": slug, "rest_base": rb,
-                    "name": info.get("name", slug),
-                    "taxonomies": info.get("taxonomies", []),
-                }
-
-        type_list = []
+    if explicit_types:
+        # Explicit --type: only discover and inventory the requested types
+        all_discovered = discover_post_types(base_url, root_data)
+        rest_base_map = {t["rest_base"]: t for t in all_discovered}
+        inventory_types = []
         for requested in args.types:
-            if requested in _WELL_KNOWN:
-                type_list.append(_WELL_KNOWN[requested])
+            if requested in rest_base_map:
+                inventory_types.append(rest_base_map[requested])
             else:
                 print(f"Warning: unknown post type '{requested}' — skipping.", file=sys.stderr, flush=True)
-
-        if not type_list:
+        if not inventory_types:
             print("No valid post types to export.", file=sys.stderr)
             sys.exit(1)
+    else:
+        # Default: discover everything on the site
+        inventory_types = discover_post_types(base_url, root_data)
+        if not inventory_types:
+            print("No content types found.", file=sys.stderr)
+            sys.exit(1)
 
-    # --- Fetch taxonomy maps upfront (small, needed for markdown rendering) ---
+    # Initialize manifest and run inventory
+    manifest = init_manifest(output_dir, domain, base_url, inventory_types)
+
+    print("\nInventory:", flush=True)
+    total_site_items = 0
+    for i, type_info in enumerate(inventory_types):
+        rest_base = type_info["rest_base"]
+        ts = get_type_state(manifest, rest_base)
+
+        # Use cached counts from a previous run
+        if ts and ts.get("total_items") is not None:
+            count = ts["total_items"]
+            pages = ts["total_pages"]
+            status = ts.get("status", "unknown")
+            print(f"  [{i + 1}] {rest_base}: {count:,} items, {pages} pages ({status})", flush=True)
+            total_site_items += count
+            continue
+
+        endpoint = f"{base_url}/wp-json/wp/v2/{rest_base}"
+        try:
+            resp = _request_with_retry(endpoint, params={"per_page": args.per_page, "page": 1})
+            if resp.status_code == 200:
+                count = int(resp.headers.get("X-WP-Total", 0))
+                pages = int(resp.headers.get("X-WP-TotalPages", 0))
+                print(f"  [{i + 1}] {rest_base}: {count:,} items, {pages} pages", flush=True)
+                update_type_state(manifest, rest_base, total_items=count, total_pages=pages)
+                total_site_items += count
+            else:
+                print(f"  [{i + 1}] {rest_base}: could not fetch (HTTP {resp.status_code})", flush=True)
+        except Exception as e:
+            print(f"  [{i + 1}] {rest_base}: could not fetch — {e}", flush=True)
+        throttle(args.delay)
+
+    print(f"  Total: {total_site_items:,} items across {len(inventory_types)} types", flush=True)
+    save_manifest(output_dir, manifest)
+
+    # --- Select types to pull ---
+    if explicit_types:
+        type_list = inventory_types
+    elif args.yes:
+        type_list = inventory_types
+    else:
+        # Interactive prompt
+        print(f"\nPull all types? [Y/n/numbers] ", end="", flush=True)
+        choice = input().strip().lower()
+        if choice in ("", "y", "yes"):
+            type_list = inventory_types
+        elif choice in ("n", "no"):
+            print("Aborted.", flush=True)
+            sys.exit(0)
+        else:
+            # Parse comma/space-separated numbers or rest_base names
+            selected = []
+            tokens = re.split(r"[,\s]+", choice)
+            rest_base_map = {t["rest_base"]: t for t in inventory_types}
+            for tok in tokens:
+                if tok.isdigit():
+                    idx = int(tok) - 1
+                    if 0 <= idx < len(inventory_types):
+                        selected.append(inventory_types[idx])
+                    else:
+                        print(f"Warning: #{tok} out of range — skipping.", file=sys.stderr, flush=True)
+                elif tok in rest_base_map:
+                    selected.append(rest_base_map[tok])
+                else:
+                    print(f"Warning: unknown type '{tok}' — skipping.", file=sys.stderr, flush=True)
+            if not selected:
+                print("No valid types selected.", file=sys.stderr)
+                sys.exit(1)
+            type_list = selected
+
+    print(f"\nSelected: {', '.join(t['rest_base'] for t in type_list)}", flush=True)
+
+    # --- Fetch taxonomy maps (needed for markdown rendering) ---
     needs_categories = any("category" in t.get("taxonomies", []) for t in type_list)
     needs_tags = any("post_tag" in t.get("taxonomies", []) for t in type_list)
 
@@ -492,13 +549,10 @@ def main():
     if needs_tags:
         print("Fetching tags...", flush=True)
         tag_map = build_taxonomy_map(base_url, "tags", per_page=100, delay=args.delay)
-        print(f"  {len(tag_map)} tags found.\n", flush=True)
+        print(f"  {len(tag_map)} tags found.", flush=True)
         throttle(args.delay)
 
-    # --- Initialize manifest ---
-    manifest = init_manifest(output_dir, domain, base_url, type_list)
-
-    # Record taxonomy counts
+    # Record taxonomy counts in manifest
     if category_map or tag_map:
         manifest.setdefault("taxonomies", {})
         if category_map:
@@ -522,6 +576,19 @@ def main():
         ts = get_type_state(manifest, rest_base)
         if ts and ts.get("status") == "complete":
             print(f"\nSkipping {rest_base} — already complete ({ts.get('items_written', '?')} items).", flush=True)
+            continue
+
+        # Skip types that failed inventory (401/403) — check before initializing state
+        total_items = ts.get("total_items") if ts else None
+        if total_items is None:
+            print(f"\nSkipping {rest_base} — no inventory data (auth required?).", flush=True)
+            continue
+
+        # Skip types with 0 items
+        if total_items == 0:
+            print(f"\nSkipping {rest_base} — 0 items.", flush=True)
+            update_type_state(manifest, rest_base, status="complete", completed_at=_now_iso())
+            save_manifest(output_dir, manifest)
             continue
 
         # Set up output directory
@@ -559,7 +626,7 @@ def main():
 
         for page_num, batch, total, total_pages in fetch_pages(endpoint, args.per_page, args.delay, start_page=start_page):
             if first_page:
-                print(f"  Total: {total} items across {total_pages} pages", flush=True)
+                # Update with actual pagination (per_page=100 vs inventory's per_page=1)
                 update_type_state(manifest, rest_base, total_items=total, total_pages=total_pages)
                 first_page = False
 
@@ -594,10 +661,12 @@ def main():
         print(f"  Written {page_written} new files to {type_dir}/", flush=True)
         total_written += page_written
 
-    # Update overall status
-    all_complete = all(
-        manifest.get("types", {}).get(t["rest_base"], {}).get("status") == "complete"
-        for t in type_list
+    # Update overall status (only consider types that had inventory data)
+    pullable = [t for t in type_list
+                if manifest.get("types", {}).get(t["rest_base"], {}).get("total_items") is not None]
+    all_complete = pullable and all(
+        manifest["types"][t["rest_base"]].get("status") == "complete"
+        for t in pullable
     )
     if all_complete:
         manifest["status"] = "complete"
